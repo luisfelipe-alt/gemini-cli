@@ -23,7 +23,7 @@ import {
   type ServerDetails,
   type ContextBreakdown,
 } from '../telemetry/types.js';
-import type { LlmRole } from '../telemetry/llmRole.js';
+import { LlmRole } from '../telemetry/llmRole.js';
 import type { Config } from '../config/config.js';
 import type { UserTierId, GeminiUserTier } from '../code_assist/types.js';
 import {
@@ -147,6 +147,10 @@ export function estimateContextBreakdown(
 }
 
 export class LoggingContentGenerator implements ContentGenerator {
+  private lastFailedPromptId: string | undefined = undefined;
+  private readonly failedModelsForPrompt = new Set<string>();
+  private flashSuccessCount = 0;
+
   constructor(
     private readonly wrapped: ContentGenerator,
     private readonly config: Config,
@@ -388,11 +392,152 @@ export class LoggingContentGenerator implements ContentGenerator {
         );
 
         try {
+          // =================================================================
+          // TEMPORARY CHANGE FOR TESTING PURPOSES: Force 429 error unless NOT_GENERATE_429_ISSUE is 'TRUE'
+          // =================================================================
+          const isTestEnv =
+            process.env['NODE_ENV'] === 'test' ||
+            process.env['VITEST'] === 'true';
+          const notGenerateEnv = process.env['NOT_GENERATE_429_ISSUE'];
+
+          // Only simulate 429 for real user prompts in the main chat
+          const isRealUserPrompt =
+            isTestEnv || /########\d+$/.test(userPromptId);
+          const isMainOrSubagent =
+            role === LlmRole.MAIN || role === LlmRole.SUBAGENT;
+          const isTargetRequest = isRealUserPrompt && isMainOrSubagent;
+
+          if (isTargetRequest) {
+            if (userPromptId !== this.lastFailedPromptId) {
+              this.lastFailedPromptId = userPromptId;
+              this.failedModelsForPrompt.clear();
+            }
+          }
+
+          // Determine if we should simulate 429 for this model
+          let shouldSimulateForModel = false;
+          if (isTargetRequest) {
+            const isPro = req.model.toLowerCase().includes('pro');
+            if (isPro || isTestEnv) {
+              shouldSimulateForModel = true;
+            } else {
+              // Flash model: allow 2 successful prompts first
+              if (this.flashSuccessCount < 2) {
+                shouldSimulateForModel = false;
+              } else {
+                shouldSimulateForModel = true;
+              }
+            }
+          }
+
+          const shouldGenerate429 =
+            isTargetRequest &&
+            (shouldSimulateForModel ||
+              this.failedModelsForPrompt.has(req.model)) &&
+            notGenerateEnv !== 'TRUE' &&
+            (!isTestEnv || notGenerateEnv === 'FALSE');
+
+          if (shouldGenerate429) {
+            const hasAlreadyFailed =
+              !isTestEnv && this.failedModelsForPrompt.has(req.model);
+            if (!isTestEnv) {
+              this.failedModelsForPrompt.add(req.model);
+            }
+
+            if (hasAlreadyFailed) {
+              debugLogger.warn(
+                `[429 SIMULATION] Model ${req.model} has already failed for this prompt. Forcing immediate non-retryable error to prevent infinite loops.`,
+              );
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+              const error = new Error(
+                'Rate limit exceeded (simulated 429 error)',
+              ) as Error & {
+                status: number;
+                response?: {
+                  status: number;
+                  data: {
+                    error: {
+                      code: number;
+                      message: string;
+                      status: string;
+                      details: unknown[];
+                    };
+                  };
+                };
+              };
+              error.status = 400; // Use 400 to make it non-retryable and non-fallbackable
+              error.response = {
+                status: 400,
+                data: {
+                  error: {
+                    code: 400,
+                    message: 'Rate limit exceeded (simulated 429 error)',
+                    status: 'INVALID_ARGUMENT',
+                    details: [],
+                  },
+                },
+              };
+              throw error;
+            } else {
+              debugLogger.warn(
+                `[429 SIMULATION] NOT_GENERATE_429_ISSUE is not set to TRUE. Forcing 429 Too Many Requests error for model: ${req.model}`,
+              );
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+              const error = new Error(
+                'Rate limit exceeded (simulated 429 error, limit: 0)',
+              ) as Error & {
+                status: number;
+                response?: {
+                  status: number;
+                  data: {
+                    error: {
+                      code: number;
+                      message: string;
+                      status: string;
+                      details: unknown[];
+                    };
+                  };
+                };
+              };
+              error.status = 429;
+              error.response = {
+                status: 429,
+                data: {
+                  error: {
+                    code: 429,
+                    message:
+                      'Rate limit exceeded (simulated 429 error, limit: 0)',
+                    status: 'RESOURCE_EXHAUSTED',
+                    details: [],
+                  },
+                },
+              };
+              throw error;
+            }
+          } else {
+            debugLogger.log(
+              `[429 SIMULATION] Bypassing 429 simulation for model: ${req.model} (either NOT_GENERATE_429_ISSUE is TRUE, running in test environment, this is a fallback model, or Flash success limit not reached).`,
+            );
+          }
+          // =================================================================
+
           const response = await this.wrapped.generateContent(
             req,
             userPromptId,
             role,
           );
+
+          // Increment Flash success count if this was a successful Flash request
+          if (
+            isTargetRequest &&
+            !isTestEnv &&
+            !req.model.toLowerCase().includes('pro')
+          ) {
+            this.flashSuccessCount++;
+            debugLogger.log(
+              `[429 SIMULATION] Flash model request succeeded. Success count: ${this.flashSuccessCount}/2`,
+            );
+          }
           spanMetadata.output = response.candidates?.[0]?.content ?? null;
           spanMetadata.attributes[GEN_AI_USAGE_INPUT_TOKENS] =
             response.usageMetadata?.promptTokenCount ?? 0;
@@ -490,11 +635,152 @@ export class LoggingContentGenerator implements ContentGenerator {
 
         let stream: AsyncGenerator<GenerateContentResponse>;
         try {
+          // =================================================================
+          // TEMPORARY CHANGE FOR TESTING PURPOSES: Force 429 error unless NOT_GENERATE_429_ISSUE is 'TRUE'
+          // =================================================================
+          const isTestEnv =
+            process.env['NODE_ENV'] === 'test' ||
+            process.env['VITEST'] === 'true';
+          const notGenerateEnv = process.env['NOT_GENERATE_429_ISSUE'];
+
+          // Only simulate 429 for real user prompts in the main chat
+          const isRealUserPrompt =
+            isTestEnv || /########\d+$/.test(userPromptId);
+          const isMainOrSubagent =
+            role === LlmRole.MAIN || role === LlmRole.SUBAGENT;
+          const isTargetRequest = isRealUserPrompt && isMainOrSubagent;
+
+          if (isTargetRequest) {
+            if (userPromptId !== this.lastFailedPromptId) {
+              this.lastFailedPromptId = userPromptId;
+              this.failedModelsForPrompt.clear();
+            }
+          }
+
+          // Determine if we should simulate 429 for this model
+          let shouldSimulateForModel = false;
+          if (isTargetRequest) {
+            const isPro = req.model.toLowerCase().includes('pro');
+            if (isPro || isTestEnv) {
+              shouldSimulateForModel = true;
+            } else {
+              // Flash model: allow 2 successful prompts first
+              if (this.flashSuccessCount < 2) {
+                shouldSimulateForModel = false;
+              } else {
+                shouldSimulateForModel = true;
+              }
+            }
+          }
+
+          const shouldGenerate429 =
+            isTargetRequest &&
+            (shouldSimulateForModel ||
+              this.failedModelsForPrompt.has(req.model)) &&
+            notGenerateEnv !== 'TRUE' &&
+            (!isTestEnv || notGenerateEnv === 'FALSE');
+
+          if (shouldGenerate429) {
+            const hasAlreadyFailed =
+              !isTestEnv && this.failedModelsForPrompt.has(req.model);
+            if (!isTestEnv) {
+              this.failedModelsForPrompt.add(req.model);
+            }
+
+            if (hasAlreadyFailed) {
+              debugLogger.warn(
+                `[429 SIMULATION] Model ${req.model} has already failed for this prompt. Forcing immediate non-retryable error to prevent infinite loops.`,
+              );
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+              const error = new Error(
+                'Rate limit exceeded (simulated 429 error)',
+              ) as Error & {
+                status: number;
+                response?: {
+                  status: number;
+                  data: {
+                    error: {
+                      code: number;
+                      message: string;
+                      status: string;
+                      details: unknown[];
+                    };
+                  };
+                };
+              };
+              error.status = 400; // Use 400 to make it non-retryable and non-fallbackable
+              error.response = {
+                status: 400,
+                data: {
+                  error: {
+                    code: 400,
+                    message: 'Rate limit exceeded (simulated 429 error)',
+                    status: 'INVALID_ARGUMENT',
+                    details: [],
+                  },
+                },
+              };
+              throw error;
+            } else {
+              debugLogger.warn(
+                `[429 SIMULATION] NOT_GENERATE_429_ISSUE is not set to TRUE. Forcing 429 Too Many Requests error for model: ${req.model}`,
+              );
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+              const error = new Error(
+                'Rate limit exceeded (simulated 429 error, limit: 0)',
+              ) as Error & {
+                status: number;
+                response?: {
+                  status: number;
+                  data: {
+                    error: {
+                      code: number;
+                      message: string;
+                      status: string;
+                      details: unknown[];
+                    };
+                  };
+                };
+              };
+              error.status = 429;
+              error.response = {
+                status: 429,
+                data: {
+                  error: {
+                    code: 429,
+                    message:
+                      'Rate limit exceeded (simulated 429 error, limit: 0)',
+                    status: 'RESOURCE_EXHAUSTED',
+                    details: [],
+                  },
+                },
+              };
+              throw error;
+            }
+          } else {
+            debugLogger.log(
+              `[429 SIMULATION] Bypassing 429 simulation for model: ${req.model} (either NOT_GENERATE_429_ISSUE is TRUE, running in test environment, this is a fallback model, or Flash success limit not reached).`,
+            );
+          }
+          // =================================================================
+
           stream = await this.wrapped.generateContentStream(
             req,
             userPromptId,
             role,
           );
+
+          // Increment Flash success count if this was a successful Flash request
+          if (
+            isTargetRequest &&
+            !isTestEnv &&
+            !req.model.toLowerCase().includes('pro')
+          ) {
+            this.flashSuccessCount++;
+            debugLogger.log(
+              `[429 SIMULATION] Flash model stream request succeeded. Success count: ${this.flashSuccessCount}/2`,
+            );
+          }
         } catch (error) {
           const durationMs = Date.now() - startTime;
 

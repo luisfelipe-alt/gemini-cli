@@ -174,7 +174,9 @@ export function parseGoogleApiError(error: unknown): GoogleApiError | null {
   }
 
   let currentError: ErrorShape | undefined =
-    fromGaxiosError(errorObj) ?? fromApiError(errorObj);
+    fromGaxiosError(errorObj) ??
+    fromApiError(errorObj) ??
+    fromCauseError(errorObj);
 
   let depth = 0;
   const maxDepth = 10;
@@ -370,4 +372,61 @@ function fromApiError(errorObj: object): ErrorShape | undefined {
     }
   }
   return outerError;
+}
+
+function fromCauseError(errorObj: object): ErrorShape | undefined {
+  const err = errorObj as {
+    code?: number;
+    status?: number;
+    cause?: unknown;
+  };
+  if (!err.cause) return undefined;
+
+  const fallbackCode = err.code ?? err.status;
+
+  const resolveError = (
+    resolved: ErrorShape | undefined,
+  ): ErrorShape | undefined => {
+    if (!resolved) return undefined;
+    const message = resolved.message;
+    const details = resolved.details;
+    const code = resolved.code ?? fallbackCode;
+    return {
+      ...(message !== undefined ? { message } : {}),
+      ...(details !== undefined ? { details } : {}),
+      ...(code !== undefined ? { code } : {}),
+    };
+  };
+
+  if (typeof err.cause === 'object' && err.cause !== null) {
+    if (
+      'error' in err.cause &&
+      err.cause.error &&
+      isErrorShape(err.cause.error)
+    ) {
+      return resolveError(err.cause.error);
+    }
+    if ('message' in err.cause && err.cause.message) {
+      if (typeof err.cause.message === 'string') {
+        const parsed = fromApiError({ message: err.cause.message });
+        if (parsed) return resolveError(parsed);
+      } else if (
+        typeof err.cause.message === 'object' &&
+        err.cause.message !== null
+      ) {
+        const msgObj = err.cause.message as { error?: unknown };
+        if (msgObj.error && isErrorShape(msgObj.error)) {
+          return resolveError(msgObj.error);
+        }
+      }
+    }
+    if (isErrorShape(err.cause)) {
+      return resolveError(err.cause);
+    }
+  }
+  if (typeof err.cause === 'string') {
+    const parsed = fromApiError({ message: err.cause });
+    if (parsed) return resolveError(parsed);
+  }
+  return undefined;
 }

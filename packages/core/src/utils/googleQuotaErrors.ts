@@ -28,6 +28,7 @@ enum GoogleApiType {
 export class TerminalQuotaError extends Error {
   retryDelayMs?: number;
   reason?: string;
+  status?: number;
 
   constructor(
     message: string,
@@ -37,6 +38,7 @@ export class TerminalQuotaError extends Error {
   ) {
     super(message);
     this.name = 'TerminalQuotaError';
+    this.status = cause.code;
     this.retryDelayMs = retryDelaySeconds
       ? retryDelaySeconds * 1000
       : undefined;
@@ -53,6 +55,7 @@ export class TerminalQuotaError extends Error {
  */
 export class RetryableQuotaError extends Error {
   retryDelayMs?: number;
+  status?: number;
 
   constructor(
     message: string,
@@ -61,6 +64,7 @@ export class RetryableQuotaError extends Error {
   ) {
     super(message);
     this.name = 'RetryableQuotaError';
+    this.status = cause.code;
     this.retryDelayMs = retryDelaySeconds
       ? retryDelaySeconds * 1000
       : undefined;
