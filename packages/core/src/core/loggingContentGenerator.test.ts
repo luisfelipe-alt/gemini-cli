@@ -78,10 +78,12 @@ describe('LoggingContentGenerator', () => {
       getSessionId: vi.fn().mockReturnValue('test-session-id'),
     } as unknown as Config;
     loggingContentGenerator = new LoggingContentGenerator(wrapped, config);
+    vi.stubEnv('NOT_GENERATE_429_ISSUE', 'TRUE');
     vi.useFakeTimers();
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.clearAllMocks();
     vi.useRealTimers();
   });
@@ -746,6 +748,38 @@ describe('LoggingContentGenerator', () => {
         input: req.contents,
         output: response,
       });
+    });
+  });
+
+  describe('temporary 429 simulation', () => {
+    it('should throw 429 error in generateContent when NOT_GENERATE_429_ISSUE is not TRUE', async () => {
+      vi.stubEnv('NOT_GENERATE_429_ISSUE', 'FALSE');
+      const req = { contents: [], model: 'gemini-pro' };
+      const promise = loggingContentGenerator.generateContent(
+        req,
+        'prompt-123',
+        LlmRole.MAIN,
+      );
+      await expect(promise).rejects.toThrowError(
+        'Rate limit exceeded (simulated 429 error, limit: 0)',
+      );
+      const err = await promise.catch((e) => e);
+      expect(err.status).toBe(429);
+    });
+
+    it('should throw 429 error in generateContentStream when NOT_GENERATE_429_ISSUE is not TRUE', async () => {
+      vi.stubEnv('NOT_GENERATE_429_ISSUE', 'FALSE');
+      const req = { contents: [], model: 'gemini-pro' };
+      const promise = loggingContentGenerator.generateContentStream(
+        req,
+        'prompt-123',
+        LlmRole.MAIN,
+      );
+      await expect(promise).rejects.toThrowError(
+        'Rate limit exceeded (simulated 429 error, limit: 0)',
+      );
+      const err = await promise.catch((e) => e);
+      expect(err.status).toBe(429);
     });
   });
 
